@@ -1,0 +1,40 @@
+---
+networks:
+  nginx-proxy-net:
+    external: true
+
+services:
+  # speech-to-text
+  wyoming-whisper:
+    container_name: wyoming-whisper-stt
+    hostname: wyoming-whisper
+    image: docker.io/library/wyoming-faster-whisper-xpu:0.11
+    restart: unless-stopped
+    #command: --model tiny-int8 --language en
+    command: --uri tcp://0.0.0.0:10300 --data-dir /data --model tiny --device cpu --model tiny-int8 --language en
+    volumes:
+      - ./volume:/data
+    environment:
+      - TZ=America/Denver
+    devices:
+      - /dev/dri/card1:/dev/dri/card1
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    ports:
+      - 10300:10300
+
+  # text-to-speech
+  piper:
+    container_name: wyoming-piper-tts
+    image: docker.io/library/wyoming-piper-xpu:2026.8.6.002
+    restart: unless-stopped
+    command: --voice en_US-lessac-medium
+    #command: --voice en_US-lessac-medium --web-server --web-server-port 5000
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ./piper-data:/data
+    environment:
+      - TZ=America/Denver
+    ports:
+      - 10200:10200
+      - 5000:5000

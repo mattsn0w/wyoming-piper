@@ -2,6 +2,8 @@ FROM ubuntu:24.04
 ARG TARGETARCH
 ARG TARGETVARIANT
 
+# Build with: docker build -f Dockerfile.ubuntu-intel-xpu  -t wyoming-piper-xpu:$(date +'%Y.%m.%d') .
+
 # Add render and video groups
 RUN \
   groupadd -g 993 render \
@@ -13,7 +15,7 @@ RUN \
   && apt-get install -y libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
   && apt-get install -y intel-media-va-driver-non-free libmfx-gen1.2 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo
 
-# Install piper with support for Intel ARC 310 GPU.
+# Install piper with support for Intel ARC A310 XPU/GPU.
 WORKDIR /usr/src
 
 COPY ./pyproject.toml ./

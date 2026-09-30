@@ -32,7 +32,7 @@ RUN \
     && .venv/bin/pip3 install --no-cache-dir \
         --extra-index-url https://www.piwheels.org/simple \
         --extra-index-url https://download.pytorch.org/whl/xpu \
-        -e '.[zeroconf,zh,faster-whisper-openvino]' \
+        -e '.[zeroconf,zh,faster-whisper-openvino,omnivoice,web]' \
     \
     && rm -rf /var/lib/apt/lists/*
 

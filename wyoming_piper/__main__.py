@@ -1,21 +1,73 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import importlib.util
 import json
 import logging
+import os
+import shlex
 import signal
+import sys
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Set
+from typing import Any, Callable, Dict, List, Set
 
 from wyoming.info import Attribution, Info, TtsProgram, TtsVoice, TtsVoiceSpeaker
 from wyoming.server import AsyncServer, AsyncTcpServer
 
 from . import __version__
-from .download import ensure_voice_exists, find_voice, get_voices
-from .handler import PiperEventHandler, get_omnivoice_voices, load_omnivoice
+from .download import VoiceNotFoundError, ensure_voice_exists, find_voice, get_voices
+from .handler import PiperEventHandler, load_omnivoice, reload_omnivoice_voices
 
 _LOGGER = logging.getLogger(__name__)
+
+# Languages whose catalog voices all use a phonemizer from an optional
+# dependency, mapped to the module that must be importable and the extra that
+# provides it. A voice advertised without its phonemizer is offered by the
+# client and then answers with silence, so these are left out of the info when
+# the dependency is missing.
+#
+# Keyed by language rather than by phoneme type because the catalog does not
+# record a phoneme type -- that lives in each voice's own config, which is only
+# on disk once the voice has been downloaded. Chinese is deliberately absent:
+# its voices are a mix of "pinyin" (needs g2pW) and "espeak" (does not), so the
+# language alone cannot say whether the extra is required. Hebrew is absent
+# because its phonemizer ships inside piper.
+_OPTIONAL_PHONEMIZER_LANGUAGES: Dict[str, "tuple[str, str]"] = {
+    "ja": ("pyopenjtalk", "ja"),
+    "th": ("tltk", "th"),
+}
+
+# The same requirement keyed by phoneme type, for voices whose config is on
+# disk. That is an exact signal where the language table above is a heuristic,
+# so it can cover Chinese too.
+_OPTIONAL_PHONEMIZER_TYPES: Dict[str, "tuple[str, str]"] = {
+    "japanese": ("pyopenjtalk", "ja"),
+    "thai": ("tltk", "th"),
+    "pinyin": ("g2pw", "zh"),
+}
+
+
+# Extras already reported as missing. The info is rebuilt on every Describe, so
+# without this the same warning is logged on each client connection.
+_WARNED_MISSING_EXTRAS: Set[str] = set()
+
+
+def _missing_phonemizer_languages() -> Dict[str, str]:
+    """Return {language: extra} for optional phonemizers that are not installed."""
+    return {
+        language: extra
+        for language, (module, extra) in _OPTIONAL_PHONEMIZER_LANGUAGES.items()
+        if importlib.util.find_spec(module) is None
+    }
+
+
+def _voice_language(voice_info: Dict[str, Any], voice_name: str) -> str:
+    """Return the language code advertised for a catalog voice."""
+    return voice_info.get("language", {}).get(
+        "code",
+        voice_info.get("espeak", {}).get("voice", voice_name.split("_")[0]),
+    )
 
 
 async def main() -> None:
@@ -108,6 +160,16 @@ async def main() -> None:
         default=5000,
         help="Port for the web UI (default: 5000)",
     )
+    parser.add_argument(
+        "--web-server-allow",
+        action="append",
+        metavar="ADDRESS",
+        help="Only serve the web UI to this IP address or CIDR range, "
+        "rejecting everything else (repeatable). The UI has no authentication, "
+        "so restrict it whenever the bind address is reachable by anything but "
+        "the intended client -- behind Home Assistant ingress that is the "
+        "proxy, 172.30.32.2. Default: serve any address that can connect.",
+    )
     #
     # OmniVoice backend options
     parser.add_argument(
@@ -150,7 +212,15 @@ async def main() -> None:
         version=__version__,
         help="Print version and exit",
     )
-    args = parser.parse_args()
+    cli_args = sys.argv[1:]
+    env_args = os.environ.get("WYOMING_PIPER_ARGS")
+    if env_args:
+        try:
+            cli_args.extend(shlex.split(env_args))
+        except ValueError as err:
+            parser.error(f"invalid WYOMING_PIPER_ARGS: {err}")
+
+    args = parser.parse_args(cli_args)
 
     if not args.download_dir:
         # Default to first data directory
@@ -161,13 +231,56 @@ async def main() -> None:
     )
     _LOGGER.debug(args)
 
+    # Optional web UI for managing custom voices, in a background thread. Started
+    # before the backend below, which can spend minutes downloading a model: the
+    # UI only reads directories, so it does not need the backend, and a missing
+    # dependency or an unavailable port should fail now rather than after the
+    # wait.
+    if args.web_server:
+        try:
+            from .web_server import make_web_server, parse_allow_list, run_web_server
+        except ImportError as err:
+            parser.error(
+                f"--web-server requires the 'web' optional dependencies ({err})"
+            )
+
+        if args.web_server_allow:
+            # Checked here so a typo is a startup error. Left to the middleware
+            # it would parse to nothing and silently reject every request.
+            try:
+                parse_allow_list(args.web_server_allow)
+            except ValueError as err:
+                parser.error(f"invalid --web-server-allow value ({err})")
+
+        try:
+            run_web_server(
+                make_web_server(args),
+                host=args.web_server_host,
+                port=args.web_server_port,
+            )
+        except OSError as err:
+            parser.error(
+                f"Could not start web UI on {args.web_server_host}:"
+                f"{args.web_server_port} ({err})"
+            )
+
     if args.backend == "omnivoice":
-        wyoming_info, voices_info = _setup_omnivoice(args)
+        # The omnivoice package is installed separately from its dependencies
+        # (see the omnivoice-deps extra), so it can be the only missing piece.
+        # Report that here rather than from an ImportError minutes into loading.
+        if importlib.util.find_spec("omnivoice") is None:
+            parser.error(
+                "--backend omnivoice requires the omnivoice package: "
+                "'pip install --no-deps omnivoice' (--no-deps skips its demo "
+                "and training dependencies, which this backend does not use)"
+            )
+
+        info_factory, voices_info = _setup_omnivoice(args)
     else:
         if not args.voice:
             parser.error("--voice is required for the piper backend")
 
-        wyoming_info, voices_info = _setup_piper(args)
+        info_factory, voices_info = _setup_piper(args)
 
     # Start server
     server = AsyncServer.from_uri(args.uri)
@@ -185,27 +298,12 @@ async def main() -> None:
         await hass_zeroconf.register_server()
         _LOGGER.debug("Zeroconf discovery enabled")
 
-    # Optional web UI for managing custom voices, in a background thread.
-    if args.web_server:
-        try:
-            from .web_server import make_web_server, run_web_server
-        except ImportError as err:
-            parser.error(
-                f"--web-server requires the 'web' optional dependencies ({err})"
-            )
-
-        run_web_server(
-            make_web_server(args),
-            host=args.web_server_host,
-            port=args.web_server_port,
-        )
-
     _LOGGER.info("Ready")
     server_task = asyncio.create_task(
         server.run(
             partial(
                 PiperEventHandler,
-                wyoming_info,
+                info_factory,
                 args,
                 voices_info,
             )
@@ -224,8 +322,15 @@ async def main() -> None:
 # -----------------------------------------------------------------------------
 
 
-def _setup_piper(args: argparse.Namespace) -> "tuple[Info, Dict[str, Any]]":
-    """Build Wyoming info and voice table for the piper backend."""
+def _setup_piper(
+    args: argparse.Namespace,
+) -> "tuple[Callable[[], Info], Dict[str, Any]]":
+    """Load the voice table for the piper backend and ensure the default voice.
+
+    Returns a factory that rebuilds the Wyoming info, so custom voices added
+    while the server runs are advertised on the next Describe. Downloading (the
+    catalog, and the default voice) happens once, here.
+    """
     # Load voice info
     voices_info = get_voices(args.download_dir, update_voices=args.update_voices)
 
@@ -236,38 +341,89 @@ def _setup_piper(args: argparse.Namespace) -> "tuple[Info, Dict[str, Any]]":
             aliases_info[voice_alias] = {"_is_alias": True, **voice_info}
 
     voices_info.update(aliases_info)
-    voices = [
-        TtsVoice(
-            name=voice_name,
-            description=get_description(voice_info),
-            attribution=Attribution(
-                name="rhasspy", url="https://github.com/rhasspy/piper"
-            ),
-            installed=True,
-            version=None,
-            languages=[
-                voice_info.get("language", {}).get(
-                    "code",
-                    voice_info.get("espeak", {}).get("voice", voice_name.split("_")[0]),
-                )
-            ],
-            speakers=(
-                [
-                    TtsVoiceSpeaker(name=speaker_name)
-                    for speaker_name in voice_info["speaker_id_map"]
-                ]
-                if voice_info.get("speaker_id_map")
-                else None
-            ),
+
+    # Build once now so a broken --voice is reported at startup, and so any
+    # "dataset" alias the default voice needs is registered before it resolves.
+    _piper_info(args, voices_info)
+
+    # Ensure default voice is downloaded
+    voice_info = voices_info.get(args.voice, {})
+    voice_name = voice_info.get("key", args.voice)
+    assert voice_name is not None
+
+    # A default voice that cannot be phonemized is an error now rather than
+    # silence on the first request. _piper_info() above has already dropped it
+    # from the advertised list, so it would otherwise fail invisibly.
+    if voice_info:
+        language = _voice_language(voice_info, voice_name)
+        extra = _missing_phonemizer_languages().get(language.split("_")[0])
+        if extra is not None:
+            raise ValueError(
+                f"Voice '{args.voice}' needs the '{extra}' optional dependencies: "
+                f"pip install 'wyoming-piper[{extra}]'"
+            )
+
+    ensure_voice_exists(voice_name, args.data_dir, args.download_dir, voices_info)
+
+    return partial(_piper_info, args, voices_info), voices_info
+
+
+def _piper_info(args: argparse.Namespace, voices_info: Dict[str, Any]) -> Info:
+    """Build Wyoming info from the catalog plus the custom voices on disk.
+
+    Voices whose phonemizer is an optional dependency that is not installed are
+    left out: advertising one means the client offers it and every request comes
+    back as silence.
+    """
+    missing_phonemizers = _missing_phonemizer_languages()
+    skipped: Dict[str, int] = {}
+
+    voices = []
+    for voice_name, voice_info in voices_info.items():
+        if voice_info.get("_is_alias", False):
+            continue
+
+        language = _voice_language(voice_info, voice_name)
+        extra = missing_phonemizers.get(language.split("_")[0])
+        if extra is not None:
+            skipped[extra] = skipped.get(extra, 0) + 1
+            continue
+
+        voices.append(
+            TtsVoice(
+                name=voice_name,
+                description=get_description(voice_info),
+                attribution=Attribution(
+                    name="rhasspy", url="https://github.com/rhasspy/piper"
+                ),
+                installed=True,
+                version=None,
+                languages=[language],
+                speakers=(
+                    [
+                        TtsVoiceSpeaker(name=speaker_name)
+                        for speaker_name in voice_info["speaker_id_map"]
+                    ]
+                    if voice_info.get("speaker_id_map")
+                    else None
+                ),
+            )
         )
-        for voice_name, voice_info in voices_info.items()
-        if not voice_info.get("_is_alias", False)
-    ]
+
+    for extra, num_skipped in sorted(skipped.items()):
+        if extra in _WARNED_MISSING_EXTRAS:
+            continue
+
+        _WARNED_MISSING_EXTRAS.add(extra)
+        _LOGGER.warning(
+            "Not advertising %s voice(s): install with the '%s' extra "
+            "(pip install 'wyoming-piper[%s]')",
+            num_skipped,
+            extra,
+            extra,
+        )
 
     custom_voice_names: Set[str] = set()
-    if args.voice not in voices_info:
-        custom_voice_names.add(args.voice)
-
     for data_dir in args.data_dir:
         data_dir = Path(data_dir)
         if not data_dir.is_dir():
@@ -278,38 +434,18 @@ def _setup_piper(args: argparse.Namespace) -> "tuple[Info, Dict[str, Any]]":
             if custom_voice_name not in voices_info:
                 custom_voice_names.add(custom_voice_name)
 
-    for custom_voice_name in custom_voice_names:
-        # Add custom voice info
-        custom_voice_path, custom_config_path = find_voice(
-            custom_voice_name, args.data_dir
-        )
-        with open(custom_config_path, "r", encoding="utf-8") as custom_config_file:
-            custom_config = json.load(custom_config_file)
-            custom_name = custom_config.get("dataset", custom_voice_path.stem)
-            custom_quality = custom_config.get("audio", {}).get("quality")
-            if custom_quality:
-                description = f"{custom_name} ({custom_quality})"
-            else:
-                description = custom_name
+    # Sorted so the "dataset" aliases below are registered deterministically
+    # when two custom voices claim the same dataset name.
+    for custom_voice_name in sorted(custom_voice_names):
+        _add_custom_voice(custom_voice_name, args, voices_info, voices)
 
-            lang_code = custom_config.get("language", {}).get("code")
-            if not lang_code:
-                lang_code = custom_config.get("espeak", {}).get("voice")
-                if not lang_code:
-                    lang_code = custom_voice_path.stem.split("_")[0]
+    if (args.voice not in voices_info) and (args.voice not in custom_voice_names):
+        # The default voice is not a catalog voice and was not found in a data
+        # dir, so try it as a name or path of its own. This runs after the scan
+        # above so that a "dataset" alias registered there can resolve it.
+        _add_custom_voice(args.voice, args, voices_info, voices)
 
-            voices.append(
-                TtsVoice(
-                    name=custom_name,
-                    description=description,
-                    version=None,
-                    attribution=Attribution(name="", url=""),
-                    installed=True,
-                    languages=[lang_code],
-                )
-            )
-
-    wyoming_info = Info(
+    return Info(
         tts=[
             TtsProgram(
                 name="piper",
@@ -325,27 +461,105 @@ def _setup_piper(args: argparse.Namespace) -> "tuple[Info, Dict[str, Any]]":
         ],
     )
 
-    # Ensure default voice is downloaded
-    voice_info = voices_info.get(args.voice, {})
-    voice_name = voice_info.get("key", args.voice)
-    assert voice_name is not None
 
-    ensure_voice_exists(voice_name, args.data_dir, args.download_dir, voices_info)
+def _add_custom_voice(
+    custom_voice_name: str,
+    args: argparse.Namespace,
+    voices_info: Dict[str, Any],
+    voices: List[TtsVoice],
+) -> None:
+    """Advertise one custom voice, registering its "dataset" name as an alias.
 
-    return wyoming_info, voices_info
+    A voice whose files are missing or unreadable is skipped with a warning
+    instead of raising: a leftover ``.onnx`` with no ``.onnx.json`` (an
+    interrupted upload, say) must not stop the server from starting. The default
+    voice is still checked by ``ensure_voice_exists``, so a broken ``--voice``
+    remains a hard error.
+
+    A voice whose phonemizer is an optional dependency that is not installed is
+    skipped the same way. Its config gives the phoneme type outright, so unlike
+    the catalog this does not have to guess from the language.
+    """
+    try:
+        custom_voice_path, custom_config_path = find_voice(
+            custom_voice_name, args.data_dir
+        )
+        with open(custom_config_path, "r", encoding="utf-8") as custom_config_file:
+            custom_config = json.load(custom_config_file)
+    except VoiceNotFoundError:
+        _LOGGER.warning(
+            "Skipping custom voice '%s': no matching .onnx and .onnx.json pair",
+            custom_voice_name,
+        )
+        return
+    except (OSError, ValueError) as err:
+        _LOGGER.warning(
+            "Skipping custom voice '%s': could not read config: %s",
+            custom_voice_name,
+            err,
+        )
+        return
+
+    phonemizer = _OPTIONAL_PHONEMIZER_TYPES.get(
+        custom_config.get("phoneme_type", "espeak")
+    )
+    if (phonemizer is not None) and (importlib.util.find_spec(phonemizer[0]) is None):
+        _LOGGER.warning(
+            "Skipping custom voice '%s': its phonemizer needs the '%s' extra "
+            "(pip install 'wyoming-piper[%s]')",
+            custom_voice_name,
+            phonemizer[1],
+            phonemizer[1],
+        )
+        return
+
+    dataset_name = custom_config.get("dataset", custom_voice_path.stem)
+    custom_quality = custom_config.get("audio", {}).get("quality")
+    if custom_quality:
+        description = f"{dataset_name} ({custom_quality})"
+    else:
+        description = dataset_name
+
+    lang_code = custom_config.get("language", {}).get("code")
+    if not lang_code:
+        lang_code = custom_config.get("espeak", {}).get("voice")
+        if not lang_code:
+            lang_code = custom_voice_path.stem.split("_")[0]
+
+    # Advertise the name that find_voice() can resolve, not the "dataset"
+    # field, which often disagrees with the file name.
+    voices.append(
+        TtsVoice(
+            name=custom_voice_name,
+            description=description,
+            version=None,
+            attribution=Attribution(name="", url=""),
+            installed=True,
+            languages=[lang_code],
+        )
+    )
+
+    if dataset_name != custom_voice_name:
+        # Older versions advertised "dataset" as the voice name, so keep
+        # accepting it from clients that stored it (and from --voice).
+        voices_info.setdefault(
+            dataset_name, {"_is_alias": True, "key": custom_voice_name}
+        )
 
 
 # -----------------------------------------------------------------------------
 
 
-def _setup_omnivoice(args: argparse.Namespace) -> "tuple[Info, Dict[str, Any]]":
-    """Build Wyoming info and ensure models for the omnivoice backend.
+def _setup_omnivoice(
+    args: argparse.Namespace,
+) -> "tuple[Callable[[], Info], Dict[str, Any]]":
+    """Ensure models for the omnivoice backend and return an info factory.
 
     The HuggingFace cache is pointed at ``--download-dir`` and the model is
-    downloaded there (unless ``--local-files-only`` is set).
+    downloaded there (unless ``--local-files-only`` is set). The returned factory
+    rescans ``--omnivoice-ref-dir`` on each call, so voices added while the
+    server runs are advertised on the next Describe.
     """
-    import os
-
     # Point the HuggingFace cache at the download dir before any hub import.
     os.environ["HF_HOME"] = str(Path(args.download_dir).resolve())
     if args.local_files_only:
@@ -355,6 +569,12 @@ def _setup_omnivoice(args: argparse.Namespace) -> "tuple[Info, Dict[str, Any]]":
     # before serving.
     load_omnivoice(args)
 
+    # voices_info is unused by the omnivoice backend.
+    return partial(_omnivoice_info, args), {}
+
+
+def _omnivoice_info(args: argparse.Namespace) -> Info:
+    """Build Wyoming info from the reference voices currently on disk."""
     from .omnivoice import (
         DEFAULT_VOICE_NAME,
         advertise_language,
@@ -375,8 +595,10 @@ def _setup_omnivoice(args: argparse.Namespace) -> "tuple[Info, Dict[str, Any]]":
             languages=get_supported_languages(),
         )
     ]
-    # Cloning and voice-design (instruct) voices discovered under --omnivoice-ref-dir.
-    for ref in get_omnivoice_voices().values():
+    # Cloning and voice-design (instruct) voices under --omnivoice-ref-dir.
+    # Rescanned rather than reused from startup so a voice added since then --
+    # by the web UI, say -- is advertised without restarting the process.
+    for ref in reload_omnivoice_voices(args).values():
         lang = advertise_language(ref.language)
         voices.append(
             TtsVoice(
@@ -389,7 +611,7 @@ def _setup_omnivoice(args: argparse.Namespace) -> "tuple[Info, Dict[str, Any]]":
             )
         )
 
-    wyoming_info = Info(
+    return Info(
         tts=[
             TtsProgram(
                 name="omnivoice",
@@ -402,9 +624,6 @@ def _setup_omnivoice(args: argparse.Namespace) -> "tuple[Info, Dict[str, Any]]":
             )
         ],
     )
-
-    # voices_info is unused by the omnivoice backend.
-    return wyoming_info, {}
 
 
 # -----------------------------------------------------------------------------

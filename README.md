@@ -1,6 +1,6 @@
 # Wyoming Piper
 
-[Wyoming protocol](https://github.com/rhasspy/wyoming) server for the [Piper](https://github.com/rhasspy/piper/) text to speech system.
+[Wyoming protocol](https://github.com/OHF-Voice/wyoming) server for the [Piper](https://github.com/OHF-Voice/piper1-gpl) text to speech system.
 
 ## Home Assistant Add-on
 
@@ -10,10 +10,12 @@
 
 ## Local Install
 
+Requires Python 3.10 or later.
+
 Clone the repository and set up Python virtual environment:
 
 ``` sh
-git clone https://github.com/rhasspy/wyoming-piper.git
+git clone https://github.com/OHF-Voice/wyoming-piper.git
 cd wyoming-piper
 script/setup
 ```
@@ -38,6 +40,32 @@ script/run_http --uri 'tcp://localhost:10200'
 
 and visit http://localhost:5000 to test.
 
+## Optional phonemizers
+
+Most voices are phonemized with espeak-ng, which is built in. Three languages
+need an extra:
+
+| Language | Extra  | Provides                    |
+| -------- | ------ | --------------------------- |
+| Chinese  | `zh`   | g2pW (`pinyin` voices only) |
+| Japanese | `ja`   | OpenJTalk                   |
+| Thai     | `th`   | TLTK                        |
+
+``` sh
+script/setup --ja --th        # or: pip install '.[ja,th]'
+```
+
+Voices that need a missing extra are **not advertised**, since a client would
+otherwise offer them and every request would answer with silence. They reappear
+once the extra is installed — no restart is needed for the voice list itself,
+which is rebuilt on each `Describe`, but the phonemizer has to be importable by
+the running process. Passing one as `--voice` is an error at startup.
+
+Chinese is the exception: `zh_CN-huayan-medium` and `zh_CN-huayan-x_low` are
+espeak voices and work without the `zh` extra, so catalog voices for `zh` are
+always advertised. A *custom* Chinese voice is filtered correctly, because its
+config records `phoneme_type`.
+
 ## OmniVoice backend (experimental)
 
 An alternative [OmniVoice](https://github.com/k2-fsa/OmniVoice) backend is
@@ -50,6 +78,17 @@ script/run --backend omnivoice \
     --uri 'tcp://0.0.0.0:10200' --data-dir /data --download-dir /data \
     --omnivoice-ref-dir /data/omnivoice_voices --omnivoice-steps 32
 ```
+
+Installing with pip takes two steps, because the `omnivoice` package requires
+gradio, librosa, webdataset and tensorboardx for its demo and training paths,
+which this backend never imports. Skipping them drops 42 packages and ~600 MB:
+
+``` sh
+pip install 'wyoming-piper[omnivoice-deps]'
+pip install --no-deps omnivoice
+```
+
+The `omnivoice` extra installs both in one step instead, at that extra ~600 MB.
 
 **Voices.** Point `--omnivoice-ref-dir` at a directory of voices organized as
 `<language>/<voice_name>/`, for example:
@@ -73,9 +112,15 @@ Each voice directory is one of two kinds:
   See [voice design](https://github.com/k2-fsa/OmniVoice/blob/master/docs/voice-design.md) for valid attributes.
   Only used when the directory has no `ref.wav`/`ref.txt`.
 
-A `default` voice is also advertised for every language OmniVoice supports;
-requesting `default` (or an empty/unknown voice name) uses OmniVoice's built-in
-speaker for the requested language.
+A `default` voice is also advertised; requesting it (or an empty/unknown voice
+name) uses OmniVoice's built-in speaker for the requested language.
+
+OmniVoice lists 646 language codes, most of them ISO 639-3 only. Advertising all
+of them buries the usable ones in Home Assistant's language picker, so `default`
+is advertised for the ~128 that have an ISO 639-1 (two-letter) tag, plus
+Cantonese, Standard Arabic and Odia. This limits only what is *advertised* —
+`--omnivoice-language` and a per-request language still accept any code
+OmniVoice knows, so the rest stay reachable.
 
 On first use, each reference is encoded and cached next to `ref.wav` as
 `ref.rvq` (regenerated whenever `ref.wav` is newer), so the reference isn't
@@ -113,33 +158,140 @@ Then visit http://localhost:5000. The page has two sections:
   cloned voice's whole directory.
 
 Each section shows a warning when its backend is not the one the server was
-started with (via `--backend`), but the UI keeps working. Changes only take
-effect for the running server after you **reload the Piper integration or
-restart Home Assistant**, so the UI reminds you after every change.
+started with (via `--backend`), but the UI keeps working. The server picks up
+added and removed voices on its own — no restart — but Home Assistant caches the
+voice list, so **reload the Piper integration** for a new voice to appear in it.
 
 `--web-server-host` / `--web-server-port` set the bind address (default
-`127.0.0.1:5000`).
+`127.0.0.1:5000`). The UI has no authentication and can upload and delete files
+under `--download-dir` / `--omnivoice-ref-dir`, so only bind it to an address
+reachable from a network you trust.
+
+When the bind address has to be routable — behind a proxy on another host, as
+with Home Assistant ingress — `--web-server-allow` narrows it back down. It
+takes an IP address or CIDR range, may be repeated, and answers everything else
+with a 403:
+
+``` sh
+script/run --voice en_US-lessac-medium \
+    --uri 'tcp://0.0.0.0:10200' --data-dir /data --download-dir /data \
+    --web-server --web-server-host 0.0.0.0 \
+    --web-server-allow 172.30.32.2   # the Home Assistant ingress proxy
+```
+
+The check uses the peer address of the connection, never `X-Forwarded-For` or a
+similar header, since a client sets those itself. It runs outside every other
+layer, so a rejected peer never reaches routing or an upload. Without the
+option, any address that can connect is served, as before.
 
 ## Docker Image
 
 ``` sh
 docker run -it \
-    -p 10200:10200 -p 5000:5000 \
+    -p 10200:10200 \
     -v /path/to/local/data:/data \
     rhasspy/wyoming-piper \
     --voice en_US-lessac-medium
 ```
 
-With OmniVoice instead of Piper:
+OmniVoice ships as a separate `omnivoice` tag, because it pulls in torch and
+transformers. It is built for `linux/amd64` only — OmniVoice needs a
+desktop/server CPU:
+
+``` sh
+docker run -it \
+    -p 10200:10200 \
+    -v /path/to/local/data:/data \
+    rhasspy/wyoming-piper:omnivoice \
+    --backend omnivoice \
+    --omnivoice-ref-dir /data/cloned-voices \
+    --omnivoice-steps 10  # higher = better quality but slower
+```
+
+The voice management web UI is **off by default**. It has no authentication, so
+only enable it on a network you trust, and add `--web-server-allow` to limit it
+to the clients that should reach it:
 
 ``` sh
 docker run -it \
     -p 10200:10200 -p 5000:5000 \
     -v /path/to/local/data:/data \
     rhasspy/wyoming-piper \
-    --backend omnivoice \
-    --omnivoice-ref-dir /data/cloned-voices \
-    --omnivoice-steps 10  # higher = better quality but slower
+    --voice en_US-lessac-medium \
+    --web-server --web-server-host 0.0.0.0
 ```
+
+### NVIDIA GPU image
+
+Build the local GPU image with:
+
+``` sh
+docker build -f Dockerfile.gpu -t wyoming-piper:gpu .
+```
+
+The image contains CUDA-enabled PyTorch and ONNX Runtime, includes OmniVoice,
+and enables `--use-cuda` automatically. Run Piper with the NVIDIA Container
+Toolkit and a persistent data directory:
+
+``` sh
+docker run --rm -it \
+    --gpus all \
+    -p 10200:10200 \
+    -v /path/to/local/data:/data \
+    wyoming-piper:gpu \
+    --voice en_US-lessac-medium
+```
+
+Set `WYOMING_PIPER_ARGS` to a shell-style argument string when Docker Compose
+environment variables are more convenient than `command`. For example:
+
+``` yaml
+services:
+  piper:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    gpus: all
+    ports:
+      - "10200:10200"
+    volumes:
+      - ./data:/data
+    environment:
+      WYOMING_PIPER_ARGS: >-
+        --voice en_US-lessac-medium
+```
+
+To run OmniVoice instead, replace the environment value with:
+
+``` yaml
+      WYOMING_PIPER_ARGS: >-
+        --backend omnivoice
+        --omnivoice-ref-dir /data/cloned-voices
+        --omnivoice-steps 10
+```
+
+The host must have an NVIDIA driver and the NVIDIA Container Toolkit. The GPU
+image is currently `linux/amd64` only because its PyTorch base image is amd64.
+
+### Container health check
+
+The image has a health check that asks the server for its info over the Wyoming
+protocol, so `docker ps` reports `unhealthy` if the server stops answering. It
+assumes the default `tcp://0.0.0.0:10200`; if you override `--uri`, override the
+check to match:
+
+``` sh
+docker run -it \
+    -p 10300:10300 \
+    -v /path/to/local/data:/data \
+    --health-cmd '/usr/src/.venv/bin/python3 -m wyoming_piper.health_check --uri tcp://127.0.0.1:10300' \
+    rhasspy/wyoming-piper \
+    --uri tcp://0.0.0.0:10300 \
+    --voice en_US-lessac-medium
+```
+
+Loading the backend can take minutes on first run, since the model has to be
+downloaded before the server starts listening. The check's start period allows
+for that, so the container reports `starting` rather than `unhealthy` until then.
 
 [Source](https://github.com/rhasspy/wyoming-addons/tree/master/piper)

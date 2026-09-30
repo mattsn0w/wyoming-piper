@@ -1,5 +1,77 @@
 # Changelog
 
+## 2.5.2
+
+- Add `--web-server-allow`, which restricts the web UI to an IP address or CIDR
+  range and rejects everything else with a 403 (repeatable, default unchanged:
+  serve anything that can connect). The UI has no authentication, and it cannot
+  simply bind loopback when it runs behind a proxy on another host -- Home
+  Assistant ingress connects to the container's address, so the server has to
+  accept from the network the proxy is on, which also exposes it to everything
+  else there. Add-ons should pass `--web-server-allow 172.30.32.2`. The check
+  uses the real peer address, never a forwarded header, and runs outside every
+  other layer so a rejected peer never reaches routing or an upload
+
+## 2.5.1
+
+- Disable ONNX Runtime telemetry (`ORT_DISABLE_TELEMETRY=1`). 1.29.0 turned it
+  on for Linux and macOS, so piper was uploading trace events to Microsoft.
+  Set `ORT_DISABLE_TELEMETRY=0` to opt back in
+- Add `script/check_voices`, which fails if the bundled `voices.json` differs
+  from the upstream piper-voices copy, and run it on pull requests.
+  `script/check_voices --update` refreshes the bundled file
+- Update `voices.json`: 13 new voices, 11 updated
+- Remove `ja` (OpenJTalk) from the Docker images for now. The extra is still
+  available via `pip install '.[ja]'` or `script/setup --ja`
+- Stop advertising voices whose phonemizer is not installed. Japanese and Thai
+  need the `ja` and `th` extras, but the whole catalog was advertised
+  regardless, so a client offered those voices and every request came back as
+  an empty audio stream. Catalog voices are filtered by language; custom voices
+  by the `phoneme_type` in their config, which also covers `pinyin`. Chinese
+  cannot be filtered by language, since `zh_CN-huayan-*` are espeak voices that
+  work without the `zh` extra. A `--voice` that cannot be phonemized is now an
+  error at startup rather than silence on the first request
+- Add `requests` to the `th` extra. tltk imports it from its package
+  `__init__` without declaring it, so `pip install 'wyoming-piper[th]'`
+  produced an install where every Thai synthesis failed with
+  `ModuleNotFoundError: No module named 'requests'`
+- Download voices and `voices.json` through a `.part` file and an atomic
+  rename. An interrupted transfer used to leave a truncated file in place, and
+  since a voice is only re-downloaded when its file is missing or empty (sizes
+  and hashes are deliberately not checked), it was never retried -- the voice
+  stayed broken, or the catalog stayed unparseable, until the file was deleted
+  by hand
+- Fix a failed synthesis reporting the wrong error. Closing the wave writer
+  before any audio was written raises `# channels not specified`, which
+  replaced the original exception -- and since that exception is what becomes
+  the Wyoming `Error` event, clients were told the wrong thing. A missing
+  phonemizer now reports itself
+
+## 2.5.0
+- Bump piper floor to 1.8.0 for the Japanese and Thai phonemizers
+- Add `ja` (OpenJTalk) and `th` (TLTK) optional dependencies, with matching
+  `script/setup --ja` and `--th` flags
+- Add `ja` to the Docker images. `th` is left out: TLTK pulls in gensim,
+  scikit-learn, scipy and pandas for ~500 MB, so install the extra by hand
+- Bump wyoming floor to 1.10.2
+- Bump the `sentence-stream` floor to 1.2.1 to match `piper-tts[zh]`
+- Stop installing torch in the default Docker image. Piper has not needed it
+  since 1.6.1 trimmed the `zh` extra; it is now installed only for omnivoice
+
+## 2.4.3
+
+- Add Docker health check (Describe/Info round trip over the Wyoming protocol)
+- Add GPU Docker image
+
+## 2.4.2
+
+- Reduce unnecessary deps for `omnivoice`
+- Bump Docker image to trixie
+
+## 2.4.1
+
+- Bump piper floor to 1.6.1 for reduced `zh` deps
+
 ## 2.4.0
 
 - Add experimental `--backend omnivoice` for [OmniVoice](https://github.com/k2-fsa/OmniVoice) TTS via onnxruntime
@@ -11,16 +83,37 @@
       style). A `default` voice is also advertised for every supported language;
       it (or an empty/unknown voice name) uses the built-in speaker.
     - `--omnivoice-language` to set the default synthesis language (default:
-      English); per-request language codes (`en_US`, `en-US`) are also honored
+      English); per-request language codes (`en_US`, `en-US`) are also honored.
+      The `default` voice is advertised for the ~128 languages with an ISO 639-1
+      tag (plus Cantonese, Standard Arabic and Odia) rather than all 646 codes
+      OmniVoice lists; the rest are still reachable, just not advertised
     - `--omnivoice-onnx-repo` to override the HuggingFace repo for the ONNX graph
     - block-wise int4 quantization is hardcoded for now (clean audio at low step
       counts, e.g. `--omnivoice-steps 10`); reproduce with
       `script/quantize_omnivoice.py`
     - the ONNX model is used from a `--data-dir` if present there, otherwise
       downloaded into `--download-dir` (used as the HuggingFace cache)
-    - install with the `omnivoice` optional dependencies
+    - install with the `omnivoice` optional dependencies. For Docker, this is a
+      separate `rhasspy/wyoming-piper:omnivoice` image (amd64 only) so the
+      default image doesn't grow a torch/transformers dependency.
+- Require Python 3.10 or later (the `omnivoice` dependencies need it)
 - Add `--local-files-only` to run the HuggingFace loader in offline mode
-- Add `--web-server` for a web UI (runs alongside the Wyoming server) to manage custom and cloned voices
+- Add `--web-server` for a web UI (runs alongside the Wyoming server) to manage
+  custom and cloned voices. Custom Piper voices are managed across every
+  `--data-dir`, not just `--download-dir` (where uploads still land). Missing
+  dependencies and an unavailable port are reported at startup, before the
+  backend loads its model.
+- Fix voices added or removed while the server runs being ignored until the
+  process restarted. The voice list was built once at startup, so a voice added
+  through the web UI was never advertised, and requesting it silently fell back
+  to the OmniVoice built-in speaker. Voices are now rescanned per `Describe` and
+  when an unknown voice is requested.
+- Fix custom voices being advertised under their `dataset` name instead of their
+  file name, which made them impossible to synthesize when the two disagreed.
+  The `dataset` name is still accepted as an alias, including as `--voice`.
+- Fix a custom voice with missing or unreadable files (a leftover `.onnx` with no
+  `.onnx.json`, for example) stopping the server from starting. It is now skipped
+  with a warning; a broken `--voice` is still an error.
 
 ## 2.3.1
 

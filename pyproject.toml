@@ -1,9 +1,9 @@
 [project]
 name = "wyoming-piper"
-version = "2.4.0"
+version = "2.5.2"
 description = "Wyoming Server for Piper"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Michael Hansen", email = "mike@rhasspy.org"}
@@ -13,17 +13,16 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "wyoming>=1.8,<2",
+    "wyoming>=1.10.2,<2",
     "regex>=2024.11.6",
-    "piper-tts>=1.4.1,<2",
-    "sentence-stream>=1.2.0,<2",
+    "piper-tts>=1.8.0,<2",
+    "sentence-stream>=1.2.1,<2",
 ]
 
 [project.urls]
@@ -45,6 +44,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.black]
 line-length = 88
+target-version = ["py310", "py311", "py312", "py313"]
 
 [tool.isort]
 profile = "black"
@@ -60,13 +60,18 @@ disallow_untyped_defs = true
 dev = [
     "black",
     "flake8",
+    "isort",
     "mypy",
     "pylint",
     "pytest",
     "pytest-asyncio",
     "build",
+    # For tests/test_web_server.py
+    "wyoming-piper[web]",
+    # For tests/dtw.py and the MFCC comparison in tests/test_piper.py.
+    # numpy<2 has no wheels for Python 3.13, which is what CI runs on.
     "scipy>=1.10,<2",
-    "numpy>=1.20,<2",
+    "numpy>=1.26,<3",
     "python-speech-features>=0.6,<1",
 ]
 http = [
@@ -78,11 +83,41 @@ zeroconf = [
 zh = [
     "piper-tts[zh]",
 ]
-omnivoice = [
-    "omnivoice",
+ja = [
+    "piper-tts[ja]",
+]
+th = [
+    "piper-tts[th]",
+    # tltk imports requests in its package __init__ but does not declare it, so
+    # "import tltk" -- and therefore every Thai synthesis -- fails with
+    # ModuleNotFoundError on a clean install without this.
+    "requests",
+]
+# Everything the ONNX inference path actually imports, minus the omnivoice
+# package itself. Pair with a separate "pip install --no-deps omnivoice":
+# omnivoice requires gradio, librosa, webdataset and tensorboardx for its demo
+# and training paths, none of which this backend imports, and skipping them drops
+# 42 packages and ~600 MB. --no-deps cannot be expressed in an extra, so the two
+# steps stay separate (see the Dockerfile and script/setup).
+# audioop-lts is needed because pydub imports the stdlib audioop, removed in
+# Python 3.13; it otherwise arrives only as a gradio dependency.
+omnivoice-deps = [
+    "torch",
+    "torchaudio",
+    "transformers",
+    "accelerate",
+    "pydub",
+    "soundfile",
+    "audioop-lts; python_version >= '3.13'",
     "onnxruntime",
     "huggingface_hub",
     "numpy",
+]
+# Self-contained, and ~600 MB heavier, since resolving the omnivoice package
+# pulls its full dependency set. Prefer omnivoice-deps plus --no-deps omnivoice.
+omnivoice = [
+    "wyoming-piper[omnivoice-deps]",
+    "omnivoice",
 ]
 web = [
     "flask>=3,<4",
